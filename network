@@ -1,8 +1,28 @@
-# Function to calculate the integer representation of an IP address for comparison
+
+# Function to convert an IP address to a 32-bit integer for comparison
 function ConvertTo-IpInt {
     param ($ip)
     $bytes = $ip.Split('.') | ForEach-Object {[int]$_}
     return ($bytes[0] -shl 24) -bor ($bytes[1] -shl 16) -bor ($bytes[2] -shl 8) -bor $bytes[3]
+}
+
+# Function to check if two CIDR ranges overlap
+function DoesSubnetOverlap {
+    param (
+        [string]$subnetPrefix,
+        [string]$usedPrefix
+    )
+    $subnetParts = $subnetPrefix.Split('/')
+    $usedParts = $usedPrefix.Split('/')
+
+    $subnetIpInt = ConvertTo-IpInt $subnetParts[0]
+    $usedIpInt = ConvertTo-IpInt $usedParts[0]
+
+    $subnetMask = 32 - [int]$subnetParts[1]
+    $usedMask = 32 - [int]$usedParts[1]
+
+    # Check if subnets overlap by comparing the masked IP addresses
+    return (($subnetIpInt -shr $subnetMask) -eq ($usedIpInt -shr $subnetMask) -or ($usedIpInt -shr $subnetMask) -eq ($subnetIpInt -shr $subnetMask))
 }
 
 # Function to get available subnets by subtracting used subnets from an address space
