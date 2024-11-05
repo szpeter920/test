@@ -1,3 +1,7 @@
+# Connect to Azure account (only if not already authenticated)
+if (!(Get-AzContext)) {
+    Connect-AzAccount
+}
 
 # Function to convert an IP address to a 32-bit integer for comparison
 function ConvertTo-IpInt {
@@ -6,7 +10,18 @@ function ConvertTo-IpInt {
     return ($bytes[0] -shl 24) -bor ($bytes[1] -shl 16) -bor ($bytes[2] -shl 8) -bor $bytes[3]
 }
 
-# Function to check if two CIDR ranges overlap
+# Function to generate a new subnet address based on an IP and offset
+function GetSubnetAddress {
+    param (
+        [string]$baseIp,
+        [int]$offset
+    )
+    $ipBytes = [System.Net.IPAddress]::Parse($baseIp).GetAddressBytes()
+    $intValue = (ConvertTo-IpInt ($ipBytes -join '.')) + $offset
+    return [System.Net.IPAddress]::new([BitConverter]::GetBytes([System.Net.IPAddress]::HostToNetworkOrder([int]$intValue)))
+}
+
+# Function to check if a subnet falls within or overlaps a used range
 function DoesSubnetOverlap {
     param (
         [string]$subnetPrefix,
@@ -16,51 +31,13 @@ function DoesSubnetOverlap {
     $usedParts = $usedPrefix.Split('/')
 
     $subnetIpInt = ConvertTo-IpInt $subnetParts[0]
-    $usedIpInt = ConvertTo-IpInt $usedParts[0]
-
     $subnetMask = 32 - [int]$subnetParts[1]
+
+    $usedIpInt = ConvertTo-IpInt $usedParts[0]
     $usedMask = 32 - [int]$usedParts[1]
 
-    # Check if subnets overlap by comparing the masked IP addresses
-    return (($subnetIpInt -shr $subnetMask) -eq ($usedIpInt -shr $subnetMask) -or ($usedIpInt -shr $subnetMask) -eq ($subnetIpInt -shr $subnetMask))
-}
-
-# Function to get available subnets by subtracting used subnets from an address space
-function GetAvailableSubnets {
-    param (
-        [string]$addressSpace,   # The base address space
-        [array]$usedSubnets      # Array of used subnets within that address space
-    )
-
-    $availableSubnets = @()
-    $addressSpaceParts = $addressSpace.Split('/')
-    $baseIp = $addressSpaceParts[0]
-    $baseCidr = [int]$addressSpaceParts[1]
-
-    # Calculate total addresses in the Address Space
-    $numAddresses = [math]::Pow(2, (32 - $baseCidr))
-
-    # Loop through potential /28 subnets
-    for ($offset = 0; $offset -lt $numAddresses; $offset += 16) {
-        $subnetIp = [System.Net.IPAddress]::new((ConvertTo-IpInt $baseIp) + $offset)
-        $subnetCidr = "$subnetIp/28"
-        
-        # Check if this /28 subnet overlaps with any used subnet
-        $isUsed = $false
-        foreach ($usedSubnet in $usedSubnets) {
-            if (DoesSubnetOverlap -subnetPrefix $subnetCidr -usedPrefix $usedSubnet) {
-                $isUsed = $true
-                break
-            }
-        }
-        
-        # If not used, add to available subnet list
-        if (-not $isUsed) {
-            $availableSubnets += $subnetCidr
-        }
-    }
-    
-    return $availableSubnets
+    # Check if the subnet range overlaps with the used range
+    return (($subnetIpInt -shr $usedMask) -eq ($usedIpInt -shr $usedMask))
 }
 
 # Retrieve all VNets in the subscription
@@ -71,15 +48,48 @@ foreach ($vnet in $vnetList) {
     Write-Output "Location: $($vnet.Location)"
     Write-Output "Address Spaces: $($vnet.AddressSpace.AddressPrefixes -join ', ')"
 
+    # Initialize a list to store used subnets
+    $usedSubnets = @()
+    
     # Retrieve used subnet ranges
-    $usedSubnets = $vnet.Subnets | ForEach-Object { $_.AddressPrefix }
-
+    foreach ($subnet in $vnet.Subnets) {
+        $usedSubnets += $subnet.AddressPrefix
+        Write-Output "`tSubnet: $($subnet.Name)"
+        Write-Output "`tAddress Prefix: $($subnet.AddressPrefix)"
+    }
+    
     # Calculate available /28 ranges within each Address Space
     foreach ($addressSpace in $vnet.AddressSpace.AddressPrefixes) {
         Write-Output "Checking Address Space: ${addressSpace}"
-        
-        # Get available /28 subnets by subtracting used ranges
-        $availableSubnets = GetAvailableSubnets -addressSpace $addressSpace -usedSubnets $usedSubnets
+
+        # Break down Address Space into /28 ranges
+        $addressPrefixParts = $addressSpace.Split('/')
+        $baseIp = $addressPrefixParts[0]
+        $baseCidr = [int]$addressPrefixParts[1]
+
+        # Calculate the number of /28 subnets within this address space
+        $numSubnets = [math]::Pow(2, (28 - $baseCidr))
+        $availableSubnets = @()
+
+        # Loop through potential /28 subnets in the range
+        for ($i = 0; $i -lt $numSubnets; $i++) {
+            $subnetIp = GetSubnetAddress -baseIp $baseIp -offset ($i * 16)  # Adjust by /28 size
+            $subnetCidr = "$($subnetIp)/28"
+
+            # Check if this /28 subnet overlaps with any used subnet
+            $isUsed = $false
+            foreach ($usedSubnet in $usedSubnets) {
+                if (DoesSubnetOverlap -subnetPrefix $subnetCidr -usedPrefix $usedSubnet) {
+                    $isUsed = $true
+                    break
+                }
+            }
+            
+            # If not used, add to available subnet list
+            if (-not $isUsed) {
+                $availableSubnets += $subnetCidr
+            }
+        }
         
         # Display available /28 subnets
         if ($availableSubnets.Count -gt 0) {
